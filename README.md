@@ -28,6 +28,21 @@ that do will self-elevate via UAC when needed.
 - Windows PowerShell 5.1 or PowerShell 7+
 - Per-script requirements are listed in each script's own README.
 
+## Disclaimer / Avertissement
+
+> **EN** — These scripts are provided **"as is"**, without any warranty. Several
+> of them modify Windows system settings (scheduled tasks, Group Policy, registry,
+> services) and require Administrator rights. **Review each script and test it in
+> a safe environment before running it.** You run them at your own risk; the
+> author accepts **no liability** for any data loss or system damage.
+>
+> **FR** — Ces scripts sont fournis **« tels quels »**, sans aucune garantie.
+> Plusieurs modifient des paramètres système Windows (tâches planifiées, stratégie
+> de groupe, registre, services) et nécessitent les droits administrateur.
+> **Relis chaque script et teste-le dans un environnement sûr avant de l'exécuter.**
+> Tu les utilises à tes propres risques ; l'auteur décline **toute responsabilité**
+> en cas de perte de données ou de dommage système.
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).
