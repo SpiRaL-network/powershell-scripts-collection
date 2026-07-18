@@ -144,6 +144,24 @@ if ($ChildScenario -ne '') {
         exit $LASTEXITCODE
     }
 
+    if ($ChildScenario -eq 'SpnExport') {
+        function Get-ADComputer {
+            [CmdletBinding()]
+            param([string]$Identity,[string[]]$Properties)
+            return [PSCustomObject]@{
+                SamAccountName='FILESERVER$';DNSHostName='fileserver.custom.test'
+                DistinguishedName='CN=FILESERVER,OU=Servers,DC=custom,DC=test'
+                ObjectGUID=[Guid]'11111111-1111-1111-1111-111111111111'
+                SID='S-1-5-21-1-2-3-1001'
+                ServicePrincipalName=@('HOST/FILESERVER','cifs/FILESERVER')
+            }
+        }
+        $exportRoot = Join-Path $TestRoot 'PRODTEST_SpnExport'
+        $sb = Get-StrippedScriptBlock $exportPath
+        & $sb -ExportRoot $exportRoot -Steps SPNs -ExcludeDrives 'Q:'
+        exit $LASTEXITCODE
+    }
+
     $baseline = Join-Path $TestRoot ("PRODTEST_Baseline_{0}" -f $ChildScenario)
     $script:NewShareCalled = $false
     $global:PRODTEST_SCENARIO = $ChildScenario
@@ -243,6 +261,55 @@ if ($ChildScenario -ne '') {
                 $members += [PSCustomObject]@{Name='UnexpectedAdmin';Domain='CUSTOM';SID='S-1-5-21-40-50-60-2999';SIDType=1;LocalAccount=$false}
             }
             return $members
+        }
+    }
+
+    if ($ChildScenario -eq 'SpnClean' -or $ChildScenario -eq 'SpnMissing' -or
+        $ChildScenario -eq 'SpnConflict' -or $ChildScenario -eq 'SpnDuplicate' -or
+        $ChildScenario -eq 'SpnExtra') {
+        function Get-ADComputer {
+            [CmdletBinding()]
+            param([string]$Identity,[string[]]$Properties)
+            $currentSpns = if ($ChildScenario -eq 'SpnMissing' -or $ChildScenario -eq 'SpnConflict') {
+                @('HOST/FILESERVER')
+            } elseif ($ChildScenario -eq 'SpnExtra') {
+                @('HOST/FILESERVER','cifs/FILESERVER','HTTP/FILESERVER')
+            } else { @('HOST/FILESERVER','cifs/FILESERVER') }
+            return [PSCustomObject]@{
+                SamAccountName='FILESERVER$';DNSHostName='fileserver.custom.test'
+                DistinguishedName='CN=FILESERVER,OU=Servers,DC=custom,DC=test'
+                ObjectGUID=[Guid]'11111111-1111-1111-1111-111111111111'
+                SID='S-1-5-21-1-2-3-1001';ServicePrincipalName=$currentSpns
+            }
+        }
+        function Get-ADForest {
+            [CmdletBinding()]
+            param()
+            return [PSCustomObject]@{Domains=@('custom.test')}
+        }
+        function Get-ADObject {
+            [CmdletBinding()]
+            param([string]$Server,[string]$LDAPFilter,[string[]]$Properties)
+            $currentOwner = [PSCustomObject]@{
+                SamAccountName='FILESERVER$';DNSHostName='fileserver.custom.test'
+                DistinguishedName='CN=FILESERVER,OU=Servers,DC=custom,DC=test'
+                ObjectGUID=[Guid]'11111111-1111-1111-1111-111111111111'
+                SID='S-1-5-21-1-2-3-1001';ObjectClass='computer'
+            }
+            $otherOwner = [PSCustomObject]@{
+                SamAccountName='OTHER$';DNSHostName='other.custom.test'
+                DistinguishedName='CN=OTHER,OU=Servers,DC=custom,DC=test'
+                ObjectGUID=[Guid]'22222222-2222-2222-2222-222222222222'
+                SID='S-1-5-21-1-2-3-2001';ObjectClass='computer'
+            }
+            if ($LDAPFilter -like '*HOST/FILESERVER*') { return @($currentOwner) }
+            if ($LDAPFilter -like '*cifs/FILESERVER*') {
+                if ($ChildScenario -eq 'SpnMissing') { return @() }
+                if ($ChildScenario -eq 'SpnConflict') { return @($otherOwner) }
+                if ($ChildScenario -eq 'SpnDuplicate') { return @($currentOwner,$otherOwner) }
+                return @($currentOwner)
+            }
+            return @()
         }
     }
 
@@ -389,6 +456,12 @@ if ($ChildScenario -ne '') {
         $invoke['Checks'] = @('Manifest','Volumes')
     } elseif ($ChildScenario -eq 'LocalAccountsClean' -or $ChildScenario -eq 'LocalAdminExtra') {
         $invoke['Checks'] = @('Manifest','LocalAccounts')
+    } elseif ($ChildScenario -eq 'SpnClean' -or $ChildScenario -eq 'SpnMissing' -or
+        $ChildScenario -eq 'SpnConflict' -or $ChildScenario -eq 'SpnDuplicate' -or
+        $ChildScenario -eq 'SpnExtra') {
+        $invoke['Checks'] = @('Manifest','SPNs')
+    } elseif ($ChildScenario -eq 'SpnLegacy') {
+        $invoke['Checks'] = @('Manifest','SPNs')
     }
     $sb = Get-StrippedScriptBlock $comparePath
     & $sb @invoke
@@ -473,7 +546,7 @@ try {
         Export-Csv (Join-Path $clean 'export_metadata.csv') -NoTypeInformation -Encoding UTF8
     Write-TestManifest $clean
 
-    foreach ($scenario in @('ExtraPerm','DaclDrift','MissingBaseline','CorruptFix','ShareDrift','RootAceExtra','FolderFix','CrossLocale','ProviderPath','ManifestOnly','TaskFixBlocked','TaskFilteredFix','TaskAllEligible','TaskBadPattern','FsrmFix','FsrmLocalized','FsrmNativeFix','FsrmVerifyFail','AdminDescription','SystemAclSkip','VolumeStable','VolumeLetterDrift','LocalAccountsClean','LocalAdminExtra')) {
+    foreach ($scenario in @('ExtraPerm','DaclDrift','MissingBaseline','CorruptFix','ShareDrift','RootAceExtra','FolderFix','CrossLocale','ProviderPath','ManifestOnly','TaskFixBlocked','TaskFilteredFix','TaskAllEligible','TaskBadPattern','FsrmFix','FsrmLocalized','FsrmNativeFix','FsrmVerifyFail','AdminDescription','SystemAclSkip','VolumeStable','VolumeLetterDrift','LocalAccountsClean','LocalAdminExtra','SpnClean','SpnMissing','SpnConflict','SpnDuplicate','SpnExtra','SpnLegacy')) {
         $target = Join-Path $runtimeFull ("PRODTEST_Baseline_{0}" -f $scenario)
         Copy-Item -LiteralPath $clean -Destination $target -Recurse
     }
@@ -514,6 +587,23 @@ try {
         [PSCustomObject]@{SchemaVersion='2.5';SelectedSteps='LocalAccounts'} |
             Export-Csv (Join-Path $localFolder 'export_metadata.csv') -NoTypeInformation -Encoding UTF8
         Write-TestManifest $localFolder
+    }
+
+    foreach ($spnScenario in @('SpnClean','SpnMissing','SpnConflict','SpnDuplicate','SpnExtra')) {
+        $spnFolder = Join-Path $runtimeFull ("PRODTEST_Baseline_{0}" -f $spnScenario)
+        [PSCustomObject]@{
+            ComputerName='FILESERVER';DomainDnsName='custom.test';SamAccountName='FILESERVER$'
+            DnsHostName='fileserver.custom.test';DistinguishedName='CN=FILESERVER,OU=Servers,DC=custom,DC=test'
+            ObjectGuid='11111111-1111-1111-1111-111111111111';ObjectSid='S-1-5-21-1-2-3-1001'
+            QueryMethod='ActiveDirectoryModule'
+        } | Export-Csv (Join-Path $spnFolder 'spn_account.csv') -NoTypeInformation -Encoding UTF8
+        @(
+            [PSCustomObject]@{SamAccountName='FILESERVER$';DistinguishedName='CN=FILESERVER,OU=Servers,DC=custom,DC=test';ServicePrincipalName='HOST/FILESERVER'},
+            [PSCustomObject]@{SamAccountName='FILESERVER$';DistinguishedName='CN=FILESERVER,OU=Servers,DC=custom,DC=test';ServicePrincipalName='cifs/FILESERVER'}
+        ) | Export-Csv (Join-Path $spnFolder 'spns.csv') -NoTypeInformation -Encoding UTF8
+        [PSCustomObject]@{SchemaVersion='2.6';SelectedSteps='SPNs'} |
+            Export-Csv (Join-Path $spnFolder 'export_metadata.csv') -NoTypeInformation -Encoding UTF8
+        Write-TestManifest $spnFolder
     }
 
     foreach ($taskScenario in @('TaskFixBlocked','TaskFilteredFix','TaskAllEligible','TaskBadPattern')) {
@@ -685,6 +775,12 @@ try {
         @{Name='VolumeLetterDrift'; Expected=1; Pattern='drive letter is F:'},
         @{Name='LocalAccountsClean'; Expected=0; Pattern='Administrators membership present'},
         @{Name='LocalAdminExtra'; Expected=1; Pattern='Unexpected destination member has local Administrators rights'},
+        @{Name='SpnClean'; Expected=0; Pattern='Present with one confirmed owner (Forest scope)'},
+        @{Name='SpnMissing'; Expected=1; Pattern='Expected SPN is missing'},
+        @{Name='SpnConflict'; Expected=1; Pattern='SPN is registered on a different AD object'},
+        @{Name='SpnDuplicate'; Expected=1; Pattern='Duplicate SPN ownership detected'},
+        @{Name='SpnExtra'; Expected=0; Pattern='Additional SPN exists on the destination computer account'},
+        @{Name='SpnLegacy'; Expected=0; Pattern='SPNs were not captured by export schemas before 2.6'},
         @{Name='MissingBaseline'; Expected=1; Pattern='Required by selected check'},
         @{Name='CorruptFix'; Expected=1; Pattern='All fixes disabled'}
     )
@@ -789,9 +885,9 @@ try {
         @(Import-Csv (Join-Path $fsrmExportFolder 'fsrm_quotas_applied.csv')).Count
     } else { -1 }
     if ($fsrmExportCode -ne 0 -or $null -eq $fsrmExportMetadata -or
-        $fsrmExportMetadata.SchemaVersion -ne '2.5' -or $fsrmExportMetadata.FsrmNativeExport -ne 'Complete' -or
+        $fsrmExportMetadata.SchemaVersion -ne '2.6' -or $fsrmExportMetadata.FsrmNativeExport -ne 'Complete' -or
         $nativeExportCount -ne 3 -or $emptyQuotaRows -ne 0) {
-        $failures.Add("FsrmExport expected schema 2.5, three native XML files and an empty quota CSV, exit=$fsrmExportCode")
+        $failures.Add("FsrmExport expected schema 2.6, three native XML files and an empty quota CSV, exit=$fsrmExportCode")
         Write-Host ("OUTPUT FsrmExport :`n{0}" -f ($fsrmExportOutput -join "`n")) -ForegroundColor DarkYellow
     } else {
         Write-Host 'PASS : FsrmExport'
@@ -811,11 +907,32 @@ try {
         @(Import-Csv (Join-Path $localExportFolder 'local_administrators_members.csv')).Count
     } else { -1 }
     if ($localExportCode -ne 0 -or $null -eq $localExportMetadata -or
-        $localExportMetadata.SchemaVersion -ne '2.5' -or $localUsersCount -ne 2 -or $localMembersCount -ne 2) {
-        $failures.Add("LocalAccountsExport expected schema 2.5, two users and two Administrators members, exit=$localExportCode")
+        $localExportMetadata.SchemaVersion -ne '2.6' -or $localUsersCount -ne 2 -or $localMembersCount -ne 2) {
+        $failures.Add("LocalAccountsExport expected schema 2.6, two users and two Administrators members, exit=$localExportCode")
         Write-Host ("OUTPUT LocalAccountsExport :`n{0}" -f ($localExportOutput -join "`n")) -ForegroundColor DarkYellow
     } else {
         Write-Host 'PASS : LocalAccountsExport'
+    }
+
+    $spnExportOutput = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath `
+        -ChildScenario SpnExport -TestRoot $runtimeFull *>&1
+    $spnExportCode = $LASTEXITCODE
+    $spnExportFolder = Join-Path $runtimeFull 'PRODTEST_SpnExport'
+    $spnExportMetadata = if (Test-Path (Join-Path $spnExportFolder 'export_metadata.csv')) {
+        Import-Csv (Join-Path $spnExportFolder 'export_metadata.csv') | Select-Object -First 1
+    } else { $null }
+    $spnAccountCount = if (Test-Path (Join-Path $spnExportFolder 'spn_account.csv')) {
+        @(Import-Csv (Join-Path $spnExportFolder 'spn_account.csv')).Count
+    } else { -1 }
+    $spnValueCount = if (Test-Path (Join-Path $spnExportFolder 'spns.csv')) {
+        @(Import-Csv (Join-Path $spnExportFolder 'spns.csv')).Count
+    } else { -1 }
+    if ($spnExportCode -ne 0 -or $null -eq $spnExportMetadata -or
+        $spnExportMetadata.SchemaVersion -ne '2.6' -or $spnAccountCount -ne 1 -or $spnValueCount -ne 2) {
+        $failures.Add("SpnExport expected schema 2.6, one account and two SPNs, exit=$spnExportCode")
+        Write-Host ("OUTPUT SpnExport :`n{0}" -f ($spnExportOutput -join "`n")) -ForegroundColor DarkYellow
+    } else {
+        Write-Host 'PASS : SpnExport'
     }
 
     $fixDi = New-Object System.IO.DirectoryInfo($dataRoot)
