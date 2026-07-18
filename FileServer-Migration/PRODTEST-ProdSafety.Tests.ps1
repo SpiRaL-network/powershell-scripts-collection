@@ -4,6 +4,9 @@ param(
     [string]$TestRoot = ''
 )
 
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 SpiRaL
+
 $ErrorActionPreference = 'Stop'
 
 function Get-HashHex {

@@ -1,5 +1,7 @@
 ﻿#Requires -Version 4.0
 #Requires -RunAsAdministrator
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 SpiRaL
 <#
 .SYNOPSIS
     Validate SMB shares, NTFS ACLs, scheduled tasks and registry baselines after disk
