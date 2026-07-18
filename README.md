@@ -9,6 +9,7 @@ does and how to use it.
 | Script | Description | Link |
 |--------|-------------|------|
 | **Set-VM-Start-Shutdown** | Auto-start a VMware Workstation VM at logon and cleanly shut it down when the host powers off. Generic (any VM), with a file-picker and self-elevation. | [📂 folder](./Set-VM-Start-Shutdown) |
+| **FileServer-Migration** | Export, validate and selectively restore Windows file-server configuration during a disk-reattachment migration. PowerShell 4.0 compatible and read-only by default on the destination. | [folder](./FileServer-Migration) |
 
 ## Usage
 
