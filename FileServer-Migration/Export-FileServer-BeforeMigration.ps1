@@ -40,7 +40,7 @@
 
 .PARAMETER Steps
     Comma-separated list of steps to run without the interactive menu.
-    Valid values: Shares, DFS, ACLs, Inheritance, Volumes, LocalAccounts, Tasks, FSRM, LanmanReg, KVS
+    Valid values: Shares, DFS, ACLs, Inheritance, Volumes, LocalAccounts, SPNs, Tasks, FSRM, LanmanReg, KVS
     Example: -Steps Shares,ACLs,KVS
 
 .PARAMETER FullACLBackup
@@ -91,7 +91,7 @@ param(
     [switch]$ExcludeHiddenShares,
     [string[]]$ExcludeDrives = @($env:SystemDrive.TrimEnd('\')),
     [switch]$Interactive,
-    [ValidateSet('Shares','DFS','ACLs','Inheritance','Volumes','LocalAccounts','Tasks','FSRM','LanmanReg','KVS')]
+    [ValidateSet('Shares','DFS','ACLs','Inheritance','Volumes','LocalAccounts','SPNs','Tasks','FSRM','LanmanReg','KVS')]
     [string[]]$Steps,
 
     # ACLs step: legacy full recursive icacls /save /T (folders + files, slow).
@@ -123,7 +123,7 @@ $ErrorActionPreference = "Continue"
 # ---------------------------------------------------------------------------
 # Step definitions (ordered - display order in menu)
 # ---------------------------------------------------------------------------
-$STEP_IDS = @('Shares','DFS','ACLs','Inheritance','Volumes','LocalAccounts','Tasks','FSRM','LanmanReg','KVS')
+$STEP_IDS = @('Shares','DFS','ACLs','Inheritance','Volumes','LocalAccounts','SPNs','Tasks','FSRM','LanmanReg','KVS')
 
 $aclDepthTxt = if ($FolderAclDepth -lt 0) { 'all depths' } else { "depth<=$FolderAclDepth" }
 
@@ -140,6 +140,7 @@ $STEP_LABELS = @{
     'Inheritance' = "NTFS Inheritance map (broken inheritance, depth=$InheritanceCheckDepth)"
     'Volumes'     = 'Volumes and Disks inventory'
     'LocalAccounts' = 'Local users and local Administrators group membership'
+    'SPNs'        = 'Active Directory computer account and SPNs'
     'Tasks'       = 'Scheduled Tasks (CSV + XML)'
     'FSRM'        = 'FSRM - CSV inventory + native XML templates and notifications'
     'LanmanReg'   = 'SMB Shares registry backup (LanmanServer\Shares)'
@@ -193,8 +194,9 @@ function Export-CsvBaseline {
         [string]$Path,
         [string[]]$Columns
     )
-    if (@($Rows).Count -gt 0) {
-        $Rows | Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
+    $nonNullRows = @($Rows | Where-Object { $null -ne $_ })
+    if ($nonNullRows.Count -gt 0) {
+        $nonNullRows | Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
         return
     }
 
@@ -372,6 +374,117 @@ function Get-LocalAccountInventory {
     }
 
     return [PSCustomObject]@{ Users=@($userRows); Administrators=@($memberRows) }
+}
+
+function ConvertTo-AdGuidText {
+    param($Value)
+    if ($null -eq $Value) { return '' }
+    if ($Value -is [Guid]) { return $Value.ToString('D') }
+    if ($Value -is [byte[]]) {
+        $guidValue = New-Object System.Guid -ArgumentList (,([byte[]]$Value))
+        return $guidValue.ToString('D')
+    }
+    $guidText = [string]$Value
+    $parsedGuid = [Guid]::Empty
+    if ([Guid]::TryParse($guidText, [ref]$parsedGuid)) { return $parsedGuid.ToString('D') }
+    return $guidText
+}
+
+function ConvertTo-AdSidText {
+    param($Value)
+    if ($null -eq $Value) { return '' }
+    if ($Value -is [System.Security.Principal.SecurityIdentifier]) { return $Value.Value }
+    if ($Value -is [byte[]]) {
+        $sidValue = New-Object System.Security.Principal.SecurityIdentifier($Value, 0)
+        return $sidValue.Value
+    }
+    return [string]$Value
+}
+
+function ConvertFrom-DistinguishedNameToDnsName {
+    param([string]$DistinguishedName)
+    if ([string]::IsNullOrWhiteSpace($DistinguishedName)) { return '' }
+    $labels = @([regex]::Matches($DistinguishedName, '(?i)(?:^|,)DC=([^,]+)') | ForEach-Object {
+        $_.Groups[1].Value
+    })
+    return ($labels -join '.')
+}
+
+function Escape-LdapFilterValue {
+    param([string]$Value)
+    if ($null -eq $Value) { return '' }
+    return $Value.Replace('\', '\5c').Replace('*', '\2a').Replace('(', '\28').Replace(')', '\29').Replace([string][char]0, '\00')
+}
+
+function Get-SearchResultValue {
+    param($SearchResult, [string]$PropertyName)
+    if ($null -eq $SearchResult) { return $null }
+    $values = $SearchResult.Properties[$PropertyName.ToLowerInvariant()]
+    if ($null -eq $values -or $values.Count -eq 0) { return $null }
+    return $values[0]
+}
+
+function Get-AdComputerSpnInventory {
+    param([string]$ComputerName = $env:COMPUTERNAME)
+
+    $adComputerCommand = Get-Command -Name Get-ADComputer -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $adComputerCommand) {
+        $computer = Get-ADComputer -Identity $ComputerName -Properties servicePrincipalName,dNSHostName,objectGUID,objectSid,distinguishedName,sAMAccountName -ErrorAction Stop
+        $distinguishedName = [string]$computer.DistinguishedName
+        $account = [PSCustomObject]@{
+            ComputerName      = $ComputerName
+            DomainDnsName     = ConvertFrom-DistinguishedNameToDnsName $distinguishedName
+            SamAccountName    = [string]$computer.SamAccountName
+            DnsHostName       = [string]$computer.DNSHostName
+            DistinguishedName = $distinguishedName
+            ObjectGuid        = ConvertTo-AdGuidText $computer.ObjectGUID
+            ObjectSid         = ConvertTo-AdSidText $computer.SID
+            QueryMethod       = 'ActiveDirectoryModule'
+        }
+        return [PSCustomObject]@{
+            Account = $account
+            SPNs = @($computer.ServicePrincipalName | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+        }
+    }
+
+    $rootDse = $null
+    $searchRoot = $null
+    $searcher = $null
+    try {
+        $rootDse = New-Object System.DirectoryServices.DirectoryEntry('LDAP://RootDSE')
+        $defaultNamingContext = [string]$rootDse.Properties['defaultNamingContext'][0]
+        if ([string]::IsNullOrWhiteSpace($defaultNamingContext)) {
+            throw 'Active Directory defaultNamingContext is unavailable'
+        }
+        $searchRoot = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$defaultNamingContext")
+        $searcher = New-Object System.DirectoryServices.DirectorySearcher($searchRoot)
+        $searcher.SearchScope = [System.DirectoryServices.SearchScope]::Subtree
+        $searcher.PageSize = 1000
+        $samAccountName = "$ComputerName`$"
+        $searcher.Filter = ("(&(objectCategory=computer)(sAMAccountName={0}))" -f (Escape-LdapFilterValue $samAccountName))
+        foreach ($propertyName in @('servicePrincipalName','dNSHostName','objectGUID','objectSid','distinguishedName','sAMAccountName')) {
+            [void]$searcher.PropertiesToLoad.Add($propertyName)
+        }
+        $result = $searcher.FindOne()
+        if ($null -eq $result) { throw "AD computer account '$samAccountName' was not found" }
+        $distinguishedName = [string](Get-SearchResultValue $result 'distinguishedName')
+        $spnValues = @($result.Properties['serviceprincipalname'] | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+        $account = [PSCustomObject]@{
+            ComputerName      = $ComputerName
+            DomainDnsName     = ConvertFrom-DistinguishedNameToDnsName $distinguishedName
+            SamAccountName    = [string](Get-SearchResultValue $result 'sAMAccountName')
+            DnsHostName       = [string](Get-SearchResultValue $result 'dNSHostName')
+            DistinguishedName = $distinguishedName
+            ObjectGuid        = ConvertTo-AdGuidText (Get-SearchResultValue $result 'objectGUID')
+            ObjectSid         = ConvertTo-AdSidText (Get-SearchResultValue $result 'objectSid')
+            QueryMethod       = 'LDAP'
+        }
+        return [PSCustomObject]@{ Account=$account; SPNs=$spnValues }
+    } finally {
+        if ($null -ne $searcher) { $searcher.Dispose() }
+        if ($null -ne $searchRoot) { $searchRoot.Dispose() }
+        if ($null -ne $rootDse) { $rootDse.Dispose() }
+    }
 }
 
 function Get-Sha256Hex {
@@ -1256,10 +1369,39 @@ if ($run['LocalAccounts']) {
 }
 
 # ---------------------------------------------------------------------------
-# Step 6 : Scheduled Tasks
+# Step 6 : Active Directory SPNs
+# ---------------------------------------------------------------------------
+if ($run['SPNs']) {
+    Write-Log "--- Step 6 : Active Directory computer account and SPNs ---"
+    try {
+        $spnInventory = Get-AdComputerSpnInventory
+        $spnAccountColumns = @('ComputerName','DomainDnsName','SamAccountName','DnsHostName',
+            'DistinguishedName','ObjectGuid','ObjectSid','QueryMethod')
+        $spnColumns = @('SamAccountName','DistinguishedName','ServicePrincipalName')
+        Export-CsvBaseline -Rows @($spnInventory.Account) -Path "$ExportRoot\spn_account.csv" -Columns $spnAccountColumns
+        $spnRows = foreach ($spnValue in @($spnInventory.SPNs)) {
+            [PSCustomObject]@{
+                SamAccountName      = [string]$spnInventory.Account.SamAccountName
+                DistinguishedName   = [string]$spnInventory.Account.DistinguishedName
+                ServicePrincipalName= [string]$spnValue
+            }
+        }
+        Export-CsvBaseline -Rows @($spnRows) -Path "$ExportRoot\spns.csv" -Columns $spnColumns
+        Write-Log ("AD computer account : {0}" -f $spnInventory.Account.DistinguishedName)
+        Write-Log ("SPNs exported       : {0}" -f @($spnInventory.SPNs).Count)
+        if (@($spnInventory.SPNs).Count -eq 0) {
+            Write-Log 'WARN : the AD computer account has no SPN values' 'WARN'
+        }
+    } catch {
+        Write-Log "ERROR : Active Directory SPN inventory failed : $_" "ERROR"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Step 7 : Scheduled Tasks
 # ---------------------------------------------------------------------------
 if ($run['Tasks']) {
-    Write-Log "--- Step 6 : Scheduled Tasks ---"
+    Write-Log "--- Step 7 : Scheduled Tasks ---"
 
     $scheduledTasksDir = "$ExportRoot\scheduled_tasks"
     Ensure-Dir $scheduledTasksDir
@@ -1318,10 +1460,10 @@ if ($run['Tasks']) {
 }
 
 # ---------------------------------------------------------------------------
-# Step 7 : FSRM
+# Step 8 : FSRM
 # ---------------------------------------------------------------------------
 if ($run['FSRM']) {
-    Write-Log "--- Step 7 : FSRM ---"
+    Write-Log "--- Step 8 : FSRM ---"
 
     if (-not (Get-Module -ListAvailable -Name FileServerResourceManager)) {
         $script:FsrmNativeExportStatus = 'Unavailable'
@@ -1514,10 +1656,10 @@ if ($run['FSRM']) {
 }
 
 # ---------------------------------------------------------------------------
-# Step 8 : LanmanServer registry backup
+# Step 9 : LanmanServer registry backup
 # ---------------------------------------------------------------------------
 if ($run['LanmanReg']) {
-    Write-Log "--- Step 8 : SMB Shares registry backup (LanmanServer) ---"
+    Write-Log "--- Step 9 : SMB Shares registry backup (LanmanServer) ---"
     $lanmanKey  = "HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer\Shares"
     $lanmanFile = "$ExportRoot\registry_LanmanServer_Shares.reg"
     $lanOut = & reg.exe export $lanmanKey $lanmanFile /y 2>&1
@@ -1529,10 +1671,10 @@ if ($run['LanmanReg']) {
 }
 
 # ---------------------------------------------------------------------------
-# Step 9 : Enterprise Vault KVS registry key
+# Step 10 : Enterprise Vault KVS registry key
 # ---------------------------------------------------------------------------
 if ($run['KVS']) {
-    Write-Log "--- Step 9 : Enterprise Vault KVS registry key ---"
+    Write-Log "--- Step 10 : Enterprise Vault KVS registry key ---"
     $kvsKey  = "HKLM\SOFTWARE\Wow6432Node\KVS"
     $kvsFile = "$ExportRoot\registry_KVS.reg"
     $regOut  = & reg.exe export $kvsKey $kvsFile /y 2>&1
@@ -1548,7 +1690,7 @@ if ($run['KVS']) {
 # a missing/corrupted baseline artifact. Kept as one-row CSV for PS4 simplicity.
 # ---------------------------------------------------------------------------
 [PSCustomObject]@{
-    SchemaVersion         = '2.5'
+    SchemaVersion         = '2.6'
     SourceServer          = $env:COMPUTERNAME
     ExportedAt            = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
     SelectedSteps         = ($runList -join ',')

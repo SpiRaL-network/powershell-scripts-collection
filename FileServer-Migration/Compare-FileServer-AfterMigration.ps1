@@ -15,7 +15,7 @@
 
 .PARAMETER Checks
     Checks to run. Default : all.
-    Valid : Manifest, Volumes, LocalAccounts, Shares, SharePerms, RootACLs, FolderACLs,
+    Valid : Manifest, Volumes, LocalAccounts, SPNs, Shares, SharePerms, RootACLs, FolderACLs,
     Inheritance, FSRM, Tasks, Registry.
 
 .PARAMETER Fix
@@ -82,7 +82,7 @@ param(
     [Parameter(Mandatory)]
     [string]$ExportFolder,
 
-    [ValidateSet('Manifest','Volumes','LocalAccounts','Shares','SharePerms','RootACLs','FolderACLs','Inheritance','FSRM','Tasks','Registry')]
+    [ValidateSet('Manifest','Volumes','LocalAccounts','SPNs','Shares','SharePerms','RootACLs','FolderACLs','Inheritance','FSRM','Tasks','Registry')]
     [string[]]$Checks,
     [ValidateSet('Shares','SharePerms','FolderAcls','Fsrm','Tasks','LanmanReg','KVS')]
     [string[]]$Fix,
@@ -105,7 +105,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Continue"
 
-$SCRIPT_VERSION = '2.6.0'
+$SCRIPT_VERSION = '2.7.0'
 $swTotal = [System.Diagnostics.Stopwatch]::StartNew()
 
 #region Helpers
@@ -495,6 +495,230 @@ function Get-AdministratorMemberMatch {
     } | Select-Object -First 1)
 }
 
+function ConvertTo-AdGuidText {
+    param($Value)
+    if ($null -eq $Value) { return '' }
+    if ($Value -is [Guid]) { return $Value.ToString('D') }
+    if ($Value -is [byte[]]) {
+        $guidValue = New-Object System.Guid -ArgumentList (,([byte[]]$Value))
+        return $guidValue.ToString('D')
+    }
+    $guidText = [string]$Value
+    $parsedGuid = [Guid]::Empty
+    if ([Guid]::TryParse($guidText, [ref]$parsedGuid)) { return $parsedGuid.ToString('D') }
+    return $guidText
+}
+
+function ConvertTo-AdSidText {
+    param($Value)
+    if ($null -eq $Value) { return '' }
+    if ($Value -is [System.Security.Principal.SecurityIdentifier]) { return $Value.Value }
+    if ($Value -is [byte[]]) {
+        $sidValue = New-Object System.Security.Principal.SecurityIdentifier($Value, 0)
+        return $sidValue.Value
+    }
+    return [string]$Value
+}
+
+function ConvertFrom-DistinguishedNameToDnsName {
+    param([string]$DistinguishedName)
+    if ([string]::IsNullOrWhiteSpace($DistinguishedName)) { return '' }
+    $labels = @([regex]::Matches($DistinguishedName, '(?i)(?:^|,)DC=([^,]+)') | ForEach-Object {
+        $_.Groups[1].Value
+    })
+    return ($labels -join '.')
+}
+
+function Escape-LdapFilterValue {
+    param([string]$Value)
+    if ($null -eq $Value) { return '' }
+    return $Value.Replace('\', '\5c').Replace('*', '\2a').Replace('(', '\28').Replace(')', '\29').Replace([string][char]0, '\00')
+}
+
+function Get-SearchResultValue {
+    param($SearchResult, [string]$PropertyName)
+    if ($null -eq $SearchResult) { return $null }
+    $values = $SearchResult.Properties[$PropertyName.ToLowerInvariant()]
+    if ($null -eq $values -or $values.Count -eq 0) { return $null }
+    return $values[0]
+}
+
+function ConvertTo-AdOwnerRow {
+    param($Object, [string]$QueryDomain = '')
+    $sidValue = Get-OptionalPropertyValue $Object 'SID' $null
+    if ($null -eq $sidValue) { $sidValue = Get-OptionalPropertyValue $Object 'ObjectSID' $null }
+    return [PSCustomObject]@{
+        DistinguishedName = [string](Get-OptionalPropertyValue $Object 'DistinguishedName')
+        SamAccountName     = [string](Get-OptionalPropertyValue $Object 'SamAccountName')
+        DnsHostName        = [string](Get-OptionalPropertyValue $Object 'DNSHostName')
+        ObjectGuid         = ConvertTo-AdGuidText (Get-OptionalPropertyValue $Object 'ObjectGUID')
+        ObjectSid          = ConvertTo-AdSidText $sidValue
+        ObjectClass        = [string](Get-OptionalPropertyValue $Object 'ObjectClass')
+        QueryDomain        = $QueryDomain
+    }
+}
+
+function Get-AdComputerSpnInventory {
+    param([string]$ComputerName = $env:COMPUTERNAME)
+
+    $adComputerCommand = Get-Command -Name Get-ADComputer -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $adComputerCommand) {
+        $computer = Get-ADComputer -Identity $ComputerName -Properties servicePrincipalName,dNSHostName,objectGUID,objectSid,distinguishedName,sAMAccountName -ErrorAction Stop
+        $distinguishedName = [string]$computer.DistinguishedName
+        $account = [PSCustomObject]@{
+            ComputerName      = $ComputerName
+            DomainDnsName     = ConvertFrom-DistinguishedNameToDnsName $distinguishedName
+            SamAccountName    = [string]$computer.SamAccountName
+            DnsHostName       = [string]$computer.DNSHostName
+            DistinguishedName = $distinguishedName
+            ObjectGuid        = ConvertTo-AdGuidText $computer.ObjectGUID
+            ObjectSid         = ConvertTo-AdSidText $computer.SID
+            QueryMethod       = 'ActiveDirectoryModule'
+        }
+        return [PSCustomObject]@{
+            Account = $account
+            SPNs = @($computer.ServicePrincipalName | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+        }
+    }
+
+    $rootDse = $null
+    $searchRoot = $null
+    $searcher = $null
+    try {
+        $rootDse = New-Object System.DirectoryServices.DirectoryEntry('LDAP://RootDSE')
+        $defaultNamingContext = [string]$rootDse.Properties['defaultNamingContext'][0]
+        if ([string]::IsNullOrWhiteSpace($defaultNamingContext)) {
+            throw 'Active Directory defaultNamingContext is unavailable'
+        }
+        $searchRoot = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$defaultNamingContext")
+        $searcher = New-Object System.DirectoryServices.DirectorySearcher($searchRoot)
+        $searcher.SearchScope = [System.DirectoryServices.SearchScope]::Subtree
+        $searcher.PageSize = 1000
+        $samAccountName = "$ComputerName`$"
+        $searcher.Filter = ("(&(objectCategory=computer)(sAMAccountName={0}))" -f (Escape-LdapFilterValue $samAccountName))
+        foreach ($propertyName in @('servicePrincipalName','dNSHostName','objectGUID','objectSid','distinguishedName','sAMAccountName')) {
+            [void]$searcher.PropertiesToLoad.Add($propertyName)
+        }
+        $result = $searcher.FindOne()
+        if ($null -eq $result) { throw "AD computer account '$samAccountName' was not found" }
+        $distinguishedName = [string](Get-SearchResultValue $result 'distinguishedName')
+        $spnValues = @($result.Properties['serviceprincipalname'] | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+        $account = [PSCustomObject]@{
+            ComputerName      = $ComputerName
+            DomainDnsName     = ConvertFrom-DistinguishedNameToDnsName $distinguishedName
+            SamAccountName    = [string](Get-SearchResultValue $result 'sAMAccountName')
+            DnsHostName       = [string](Get-SearchResultValue $result 'dNSHostName')
+            DistinguishedName = $distinguishedName
+            ObjectGuid        = ConvertTo-AdGuidText (Get-SearchResultValue $result 'objectGUID')
+            ObjectSid         = ConvertTo-AdSidText (Get-SearchResultValue $result 'objectSid')
+            QueryMethod       = 'LDAP'
+        }
+        return [PSCustomObject]@{ Account=$account; SPNs=$spnValues }
+    } finally {
+        if ($null -ne $searcher) { $searcher.Dispose() }
+        if ($null -ne $searchRoot) { $searchRoot.Dispose() }
+        if ($null -ne $rootDse) { $rootDse.Dispose() }
+    }
+}
+
+function Find-AdSpnOwners {
+    param([string]$ServicePrincipalName, [string]$FallbackDomainDnsName = '')
+
+    $adObjectCommand = Get-Command -Name Get-ADObject -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $adObjectCommand) {
+        $domains = @()
+        $scope = 'Domain'
+        $forestCommand = Get-Command -Name Get-ADForest -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $forestCommand) {
+            try {
+                $forest = Get-ADForest -ErrorAction Stop
+                $domains = @($forest.Domains)
+                if ($domains.Count -gt 0) { $scope = 'Forest' }
+            } catch { $domains = @() }
+        }
+        if ($domains.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace($FallbackDomainDnsName)) {
+            $domains = @($FallbackDomainDnsName)
+        }
+        if ($domains.Count -gt 0) {
+            $ownerRows = New-Object System.Collections.Generic.List[PSCustomObject]
+            $ownerKeys = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
+            $ldapFilter = ("(servicePrincipalName={0})" -f (Escape-LdapFilterValue $ServicePrincipalName))
+            foreach ($domainName in $domains) {
+                $objects = @(Get-ADObject -Server $domainName -LDAPFilter $ldapFilter `
+                    -Properties servicePrincipalName,dNSHostName,objectGUID,objectSid,distinguishedName,sAMAccountName,objectClass `
+                    -ErrorAction Stop)
+                foreach ($adObject in $objects) {
+                    $ownerRow = ConvertTo-AdOwnerRow $adObject $domainName
+                    $ownerKey = if (-not [string]::IsNullOrWhiteSpace($ownerRow.ObjectGuid)) {
+                        $ownerRow.ObjectGuid
+                    } else { $ownerRow.DistinguishedName }
+                    if ($ownerKeys.Add($ownerKey)) { $ownerRows.Add($ownerRow) }
+                }
+            }
+            return [PSCustomObject]@{ Owners=@($ownerRows); Scope=$scope; Method='ActiveDirectoryModule' }
+        }
+    }
+
+    $rootDse = $null
+    $searchRoot = $null
+    $searcher = $null
+    $results = $null
+    try {
+        $rootDse = New-Object System.DirectoryServices.DirectoryEntry('LDAP://RootDSE')
+        $defaultNamingContext = [string]$rootDse.Properties['defaultNamingContext'][0]
+        $rootDomainNamingContext = [string]$rootDse.Properties['rootDomainNamingContext'][0]
+        $scope = 'Forest'
+        try {
+            $searchRoot = New-Object System.DirectoryServices.DirectoryEntry("GC://$rootDomainNamingContext")
+            [void]$searchRoot.NativeObject
+        } catch {
+            if ($null -ne $searchRoot) { $searchRoot.Dispose() }
+            $searchRoot = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$defaultNamingContext")
+            $scope = 'Domain'
+        }
+        $searcher = New-Object System.DirectoryServices.DirectorySearcher($searchRoot)
+        $searcher.SearchScope = [System.DirectoryServices.SearchScope]::Subtree
+        $searcher.PageSize = 1000
+        $searcher.Filter = ("(servicePrincipalName={0})" -f (Escape-LdapFilterValue $ServicePrincipalName))
+        foreach ($propertyName in @('dNSHostName','objectGUID','objectSid','distinguishedName','sAMAccountName','objectClass')) {
+            [void]$searcher.PropertiesToLoad.Add($propertyName)
+        }
+        $ownerRows = New-Object System.Collections.Generic.List[PSCustomObject]
+        $results = $searcher.FindAll()
+        foreach ($result in $results) {
+            $objectClasses = @($result.Properties['objectclass'])
+            $objectClass = if ($objectClasses.Count -gt 0) { [string]$objectClasses[-1] } else { '' }
+            $ownerRows.Add([PSCustomObject]@{
+                DistinguishedName = [string](Get-SearchResultValue $result 'distinguishedName')
+                SamAccountName     = [string](Get-SearchResultValue $result 'sAMAccountName')
+                DnsHostName        = [string](Get-SearchResultValue $result 'dNSHostName')
+                ObjectGuid         = ConvertTo-AdGuidText (Get-SearchResultValue $result 'objectGUID')
+                ObjectSid          = ConvertTo-AdSidText (Get-SearchResultValue $result 'objectSid')
+                ObjectClass        = $objectClass
+                QueryDomain        = ''
+            })
+        }
+        return [PSCustomObject]@{ Owners=@($ownerRows); Scope=$scope; Method='LDAP' }
+    } finally {
+        if ($null -ne $results) { $results.Dispose() }
+        if ($null -ne $searcher) { $searcher.Dispose() }
+        if ($null -ne $searchRoot) { $searchRoot.Dispose() }
+        if ($null -ne $rootDse) { $rootDse.Dispose() }
+    }
+}
+
+function Test-IsSameAdObject {
+    param($Account, $Owner)
+    $accountGuid = ConvertTo-AdGuidText (Get-OptionalPropertyValue $Account 'ObjectGuid')
+    $ownerGuid = ConvertTo-AdGuidText (Get-OptionalPropertyValue $Owner 'ObjectGuid')
+    if (-not [string]::IsNullOrWhiteSpace($accountGuid) -and
+        -not [string]::IsNullOrWhiteSpace($ownerGuid)) {
+        return ($accountGuid -ieq $ownerGuid)
+    }
+    return ([string](Get-OptionalPropertyValue $Account 'DistinguishedName') -ieq
+        [string](Get-OptionalPropertyValue $Owner 'DistinguishedName'))
+}
+
 function Test-XmlFileWellFormed {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
@@ -835,6 +1059,7 @@ function Get-Remediation {
         'Manifest'         { return 'Re-copy the export folder from the source server (file corrupted or missing during transfer)' }
         'Volume'           { return 'Check disk attachment and drive letter assignment (diskmgmt.msc / Get-Disk / Get-Partition)' }
         'LocalAccount'     { return 'Recreate missing local users manually with new passwords, then restore only the required Administrators memberships' }
+        'SPN'              { return 'Review with setspn -L, -Q and -X; use setspn -S only after confirming the correct AD account owner' }
         'Share'            { return 'Re-run with -Fix Shares, or create manually with New-SmbShare (parameters are in shares.csv)' }
         'SharePerm'        { return 'Re-run with -Fix SharePerms, or restore manually with Grant-SmbShareAccess / Block-SmbShareAccess' }
         'NTFS ACL'         { return 'Root DACL drift : icacls /restore the matching acls_root_*.bin, or Restore-FolderAcls.ps1' }
@@ -875,13 +1100,14 @@ function Format-FsRights {
 # ---------------------------------------------------------------------------
 # Check / fix selection
 # ---------------------------------------------------------------------------
-$CHECK_IDS = @('Manifest','Volumes','LocalAccounts','Shares','SharePerms','RootACLs','FolderACLs','Inheritance','FSRM','Tasks','Registry')
+$CHECK_IDS = @('Manifest','Volumes','LocalAccounts','SPNs','Shares','SharePerms','RootACLs','FolderACLs','Inheritance','FSRM','Tasks','Registry')
 $FIX_IDS   = @('Shares','SharePerms','FolderAcls','Fsrm','Tasks','LanmanReg','KVS')
 
 $CHECK_LABELS = @{
     'Manifest'    = 'Export integrity (SHA256 manifest)'
     'Volumes'     = 'Volumes present and sized'
     'LocalAccounts' = 'Local users and local Administrators membership'
+    'SPNs'        = 'Active Directory computer account SPNs and ownership'
     'Shares'      = 'SMB shares present'
     'SharePerms'  = 'SMB share-level permissions'
     'RootACLs'    = 'NTFS ACLs of share roots (ACE by ACE)'
@@ -1195,7 +1421,7 @@ if ($activeFixes.Count -gt 0 -and -not $manifestVerified) {
 # NOTE : a missing file makes Import-Csv throw a statement-terminating error that
 # -ErrorAction SilentlyContinue does NOT suppress (partial exports via -Steps) - guard with Test-Path.
 $csvShares = $null; $csvPerms = $null; $csvAcls = $null; $csvVolumes = $null; $csvDisks = $null
-$csvLocalUsers = $null; $csvLocalAdministrators = $null; $exportMetadata = $null
+$csvLocalUsers = $null; $csvLocalAdministrators = $null; $csvSpnAccount = $null; $csvSpns = $null; $exportMetadata = $null
 if (Test-Path "$ExportFolder\shares.csv")             { $csvShares  = Import-Csv "$ExportFolder\shares.csv"             -Encoding UTF8 }
 if (Test-Path "$ExportFolder\shares_permissions.csv") { $csvPerms   = Import-Csv "$ExportFolder\shares_permissions.csv" -Encoding UTF8 }
 if (Test-Path "$ExportFolder\acls_roots.csv")         { $csvAcls    = Import-Csv "$ExportFolder\acls_roots.csv"         -Encoding UTF8 }
@@ -1205,6 +1431,8 @@ if (Test-Path "$ExportFolder\local_users.csv")        { $csvLocalUsers = Import-
 if (Test-Path "$ExportFolder\local_administrators_members.csv") {
     $csvLocalAdministrators = Import-Csv "$ExportFolder\local_administrators_members.csv" -Encoding UTF8
 }
+if (Test-Path "$ExportFolder\spn_account.csv")         { $csvSpnAccount = Import-Csv "$ExportFolder\spn_account.csv" -Encoding UTF8 | Select-Object -First 1 }
+if (Test-Path "$ExportFolder\spns.csv")                { $csvSpns = Import-Csv "$ExportFolder\spns.csv" -Encoding UTF8 }
 if (Test-Path "$ExportFolder\export_metadata.csv")    { $exportMetadata = Import-Csv "$ExportFolder\export_metadata.csv" -Encoding UTF8 | Select-Object -First 1 }
 
 $missingBaselineItems = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
@@ -1240,6 +1468,30 @@ if ($check['LocalAccounts']) {
         } else {
             Add-Finding "LocalAccount" "legacy export" "WARN" `
                 "Local users and Administrators membership were not captured by export schemas before 2.5"
+        }
+    }
+}
+if ($check['SPNs']) {
+    $spnBaselineExpected = $false
+    if ($null -ne $exportMetadata) {
+        $selectedStepText = [string](Get-OptionalPropertyValue $exportMetadata 'SelectedSteps')
+        $schemaText = [string](Get-OptionalPropertyValue $exportMetadata 'SchemaVersion')
+        $schemaVersionValue = New-Object System.Version -ArgumentList 0,0
+        try { $schemaVersionValue = [System.Version]::Parse($schemaText) } catch { }
+        $spnBaselineExpected = ($selectedStepText -match '(^|,)\s*SPNs\s*(,|$)' -or
+            $schemaVersionValue -ge ([System.Version]::Parse('2.6')))
+    }
+    $missingSpnArtifacts = @()
+    foreach ($spnArtifact in @('spn_account.csv','spns.csv')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $ExportFolder $spnArtifact) -PathType Leaf)) {
+            $missingSpnArtifacts += $spnArtifact
+        }
+    }
+    if ($missingSpnArtifacts.Count -gt 0) {
+        if ($spnBaselineExpected) {
+            foreach ($spnArtifact in $missingSpnArtifacts) { Add-MissingBaseline $spnArtifact 'SPNs' }
+        } else {
+            Add-Finding 'SPN' 'legacy export' 'WARN' 'SPNs were not captured by export schemas before 2.6'
         }
     }
 }
@@ -1462,7 +1714,113 @@ if ($check['LocalAccounts'] -and
 }
 
 # ---------------------------------------------------------------------------
-# 3. SMB Shares
+# 3. Active Directory SPNs
+# ---------------------------------------------------------------------------
+if ($check['SPNs'] -and
+    (Test-Path -LiteralPath (Join-Path $ExportFolder 'spn_account.csv') -PathType Leaf) -and
+    (Test-Path -LiteralPath (Join-Path $ExportFolder 'spns.csv') -PathType Leaf)) {
+    Write-Host "`n--- Checking Active Directory computer account SPNs ---" -ForegroundColor White
+    try {
+        $currentSpnInventory = Get-AdComputerSpnInventory
+        $baselineSpnAccount = $csvSpnAccount
+        if ($null -eq $baselineSpnAccount) {
+            Add-Finding 'SPN' 'computer account' 'ERROR' 'spn_account.csv has no account row'
+        } else {
+            $expectedSam = [string](Get-OptionalPropertyValue $baselineSpnAccount 'SamAccountName')
+            $currentSam = [string](Get-OptionalPropertyValue $currentSpnInventory.Account 'SamAccountName')
+            if ($currentSam -ine $expectedSam) {
+                Add-Finding 'SPN' 'computer account' 'ERROR' ("sAMAccountName differs: before='{0}', after='{1}'" -f $expectedSam, $currentSam)
+            }
+            $expectedDns = [string](Get-OptionalPropertyValue $baselineSpnAccount 'DnsHostName')
+            $currentDns = [string](Get-OptionalPropertyValue $currentSpnInventory.Account 'DnsHostName')
+            if ($currentDns -ine $expectedDns) {
+                Add-Finding 'SPN' 'computer account' 'ERROR' ("dNSHostName differs: before='{0}', after='{1}'" -f $expectedDns, $currentDns)
+            }
+            $expectedGuid = ConvertTo-AdGuidText (Get-OptionalPropertyValue $baselineSpnAccount 'ObjectGuid')
+            $currentGuid = ConvertTo-AdGuidText (Get-OptionalPropertyValue $currentSpnInventory.Account 'ObjectGuid')
+            if (-not [string]::IsNullOrWhiteSpace($expectedGuid) -and $currentGuid -ine $expectedGuid) {
+                Add-Finding 'SPN' 'computer account' 'WARN' ("AD object GUID changed: before='{0}', after='{1}' (account may have been recreated)" -f $expectedGuid, $currentGuid)
+            }
+            $expectedSid = [string](Get-OptionalPropertyValue $baselineSpnAccount 'ObjectSid')
+            $currentSid = [string](Get-OptionalPropertyValue $currentSpnInventory.Account 'ObjectSid')
+            if (-not [string]::IsNullOrWhiteSpace($expectedSid) -and $currentSid -ine $expectedSid) {
+                Add-Finding 'SPN' 'computer account' 'WARN' ("AD object SID changed: before='{0}', after='{1}' (account may have been recreated)" -f $expectedSid, $currentSid)
+            }
+            $expectedDn = [string](Get-OptionalPropertyValue $baselineSpnAccount 'DistinguishedName')
+            $currentDn = [string](Get-OptionalPropertyValue $currentSpnInventory.Account 'DistinguishedName')
+            if ($currentDn -ine $expectedDn) {
+                Add-Finding 'SPN' 'computer account' 'WARN' ("Distinguished name changed: before='{0}', after='{1}'" -f $expectedDn, $currentDn)
+            }
+            if ($currentSam -ieq $expectedSam -and $currentDns -ieq $expectedDns) {
+                Add-Finding 'SPN' 'computer account' 'OK' ("AD computer account found: {0}" -f $currentDn)
+            }
+        }
+
+        $expectedSpns = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($spnRow in @($csvSpns)) {
+            $spnValue = [string](Get-OptionalPropertyValue $spnRow 'ServicePrincipalName')
+            if (-not [string]::IsNullOrWhiteSpace($spnValue)) { [void]$expectedSpns.Add($spnValue) }
+        }
+        $currentSpns = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($spnValue in @($currentSpnInventory.SPNs)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$spnValue)) { [void]$currentSpns.Add([string]$spnValue) }
+        }
+        if ($expectedSpns.Count -eq 0) {
+            Add-Finding 'SPN' 'baseline' 'WARN' 'No SPN was present on the exported AD computer account'
+        }
+
+        $scopeWarningShown = $false
+        $fallbackDomain = if ($null -ne $baselineSpnAccount) {
+            [string](Get-OptionalPropertyValue $baselineSpnAccount 'DomainDnsName')
+        } else { [string](Get-OptionalPropertyValue $currentSpnInventory.Account 'DomainDnsName') }
+        foreach ($expectedSpn in @($expectedSpns | Sort-Object)) {
+            try {
+                $ownership = Find-AdSpnOwners $expectedSpn $fallbackDomain
+                if ($ownership.Scope -ne 'Forest' -and -not $scopeWarningShown) {
+                    Add-Finding 'SPN' 'ownership scope' 'WARN' 'Global Catalog/forest lookup unavailable; duplicate ownership was checked in the current domain only'
+                    $scopeWarningShown = $true
+                }
+                $sameOwners = @($ownership.Owners | Where-Object { Test-IsSameAdObject $currentSpnInventory.Account $_ })
+                $otherOwners = @($ownership.Owners | Where-Object { -not (Test-IsSameAdObject $currentSpnInventory.Account $_) })
+                $presentOnCurrent = $currentSpns.Contains($expectedSpn)
+                if ($otherOwners.Count -gt 0) {
+                    $otherNames = @($otherOwners | ForEach-Object {
+                        if (-not [string]::IsNullOrWhiteSpace([string]$_.DistinguishedName)) { [string]$_.DistinguishedName }
+                        else { [string]$_.SamAccountName }
+                    }) -join '; '
+                    if ($sameOwners.Count -gt 0) {
+                        Add-Finding 'SPN' $expectedSpn 'ERROR' "Duplicate SPN ownership detected; also registered on: $otherNames"
+                    } else {
+                        Add-Finding 'SPN' $expectedSpn 'ERROR' "SPN is registered on a different AD object: $otherNames"
+                    }
+                } elseif (-not $presentOnCurrent) {
+                    if ($sameOwners.Count -gt 0) {
+                        Add-Finding 'SPN' $expectedSpn 'ERROR' 'SPN lookup and direct account read disagree; check AD replication before migration sign-off'
+                    } else {
+                        Add-Finding 'SPN' $expectedSpn 'ERROR' 'Expected SPN is missing and is not registered on any searched AD object'
+                    }
+                } elseif ($sameOwners.Count -ne 1) {
+                    Add-Finding 'SPN' $expectedSpn 'ERROR' 'SPN is present on the computer account but forest ownership lookup did not confirm exactly one owner'
+                } else {
+                    Add-Finding 'SPN' $expectedSpn 'OK' ("Present with one confirmed owner ({0} scope)" -f $ownership.Scope)
+                }
+            } catch {
+                Add-Finding 'SPN' $expectedSpn 'ERROR' "SPN ownership lookup failed: $_"
+            }
+        }
+
+        foreach ($currentSpn in @($currentSpns | Sort-Object)) {
+            if (-not $expectedSpns.Contains($currentSpn)) {
+                Add-Finding 'SPN' $currentSpn 'WARN' 'Additional SPN exists on the destination computer account; review but no automatic removal is performed'
+            }
+        }
+    } catch {
+        Add-Finding 'SPN' 'inventory' 'ERROR' "Active Directory SPN verification failed: $_"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 4. SMB Shares
 # ---------------------------------------------------------------------------
 if ($check['Shares']) {
     Write-Host "`n--- Checking SMB shares ---" -ForegroundColor White
